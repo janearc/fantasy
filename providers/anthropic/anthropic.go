@@ -129,6 +129,21 @@ func buildRequestOptions(call fantasy.Call, rawTools []json.RawMessage, betaFlag
 		// this will need updating.
 		reqOpts = append(reqOpts, option.WithJSONSet("tools", rawTools))
 	}
+	// context_management is beta-only. It's set on the body the way beta
+	// tools are. Its beta flag goes beside it. ExtraBody comes after, so it
+	// can still override the field.
+	if cm := providerOptions.contextManagement(); cm != nil {
+		reqOpts = append(reqOpts, option.WithJSONSet("context_management", cm))
+		betaFlags = append(betaFlags, cm.betaFlags()...)
+	}
+	if compaction := providerOptions.Compaction; compaction != nil {
+		reqOpts = append(reqOpts, option.WithJSONSet("compaction", compaction.wire()))
+		betaFlags = appendFlag(betaFlags, onDemandCompactBeta)
+	}
+	// Every request carrying a compaction block needs that block's beta.
+	for _, flag := range carriedCompactionBetas(call.Prompt) {
+		betaFlags = appendFlag(betaFlags, flag)
+	}
 	for k, v := range providerOptions.ExtraBody {
 		reqOpts = append(reqOpts, option.WithJSONSet(k, v))
 	}
@@ -379,6 +394,12 @@ func (a languageModel) prepareParams(call fantasy.Call) (
 			return nil, nil, nil, nil, &fantasy.Error{Title: "invalid argument", Message: "anthropic provider options should be *anthropic.ProviderOptions"}
 		}
 	}
+	if providerOptions.Compaction != nil && providerOptions.contextManagement() != nil {
+		return nil, nil, nil, nil, &fantasy.Error{Title: "invalid argument", Message: "compaction not supported with context management"}
+	}
+	if providerOptions.Compaction != nil && slices.Contains(carriedCompactionBetas(call.Prompt), compactBeta) {
+		return nil, nil, nil, nil, &fantasy.Error{Title: "invalid argument", Message: "compaction on demand not supported after threshold compaction"}
+	}
 	sendReasoning := true
 	if providerOptions.SendReasoning != nil {
 		sendReasoning = *providerOptions.SendReasoning
@@ -488,6 +509,20 @@ func (a languageModel) prepareParams(call fantasy.Call) (
 			params.ToolChoice = *toolChoice
 		}
 		warnings = append(warnings, toolWarnings...)
+		// The API refuses a compaction request whose ToolChoice is
+		// ToolChoiceRequired or a named tool. Summaries don't run tools.
+		if providerOptions.Compaction != nil && (params.ToolChoice.OfAny != nil || params.ToolChoice.OfTool != nil) {
+			details := "required tool choice not supported with compaction"
+			if params.ToolChoice.OfTool != nil {
+				details = fmt.Sprintf("named tool %s not supported with compaction", params.ToolChoice.OfTool.Name)
+			}
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{}
+			warnings = append(warnings, fantasy.CallWarning{
+				Type:    fantasy.CallWarningTypeUnsupportedSetting,
+				Setting: "ToolChoice",
+				Details: details,
+			})
+		}
 	}
 
 	return params, rawTools, warnings, betaFlags, nil
@@ -1103,6 +1138,13 @@ func toPrompt(prompt fantasy.Prompt, sendReasoningData bool) ([]anthropic.TextBl
 						if !ok {
 							continue
 						}
+						// Compaction blocks replace the conversation before
+						// them. So they go back even when reasoning data
+						// isn't sent.
+						if compaction := GetCompactionMetadata(part.Options()); compaction != nil {
+							anthropicContent = append(anthropicContent, compactionBlockParam(compaction.Block, cacheControl != nil))
+							continue
+						}
 						if !sendReasoningData {
 							warnings = append(warnings, fantasy.CallWarning{
 								Type:    fantasy.CallWarningTypeOther,
@@ -1195,6 +1237,30 @@ func toPrompt(prompt fantasy.Prompt, sendReasoningData bool) ([]anthropic.TextBl
 		}
 	}
 	return systemBlocks, messages, warnings
+}
+
+// compactionBetaOf is the beta flag later requests will need if the reply to
+// call holds a compaction block.
+func compactionBetaOf(call fantasy.Call) string {
+	options, _ := call.ProviderOptions[Name].(*ProviderOptions)
+	return options.compactionBeta()
+}
+
+// compactionBlockParam is a compaction block to send back. The SDK's stable
+// types don't have a compaction block. So the block goes as the API returned
+// it, through the SDK's override for values it doesn't model. The override
+// goes in the union's text variant. compactionBlockParam adds one field, a
+// cache breakpoint. The API allows one on a compaction block.
+func compactionBlockParam(block json.RawMessage, cached bool) anthropic.ContentBlockParamUnion {
+	if cached {
+		var fields map[string]any
+		if json.Unmarshal(block, &fields) == nil {
+			fields["cache_control"] = map[string]any{"type": "ephemeral"}
+			block, _ = json.Marshal(fields)
+		}
+	}
+	override := param.Override[anthropic.TextBlockParam](block)
+	return anthropic.ContentBlockParamUnion{OfText: &override}
 }
 
 func hasVisibleUserContent(content []anthropic.ContentBlockParamUnion) bool {
@@ -1301,7 +1367,9 @@ func buildWebSearchToolResultBlock(toolCallID string, searchMeta *WebSearchResul
 
 func mapFinishReason(finishReason string) fantasy.FinishReason {
 	switch finishReason {
-	case "end_turn", "pause_turn", "stop_sequence":
+	case "end_turn", "pause_turn", "stop_sequence", "compaction":
+		// "compaction" ends a turn that paused after compacting. Like
+		// "pause_turn", it continues when the conversation is sent again.
 		return fantasy.FinishReasonStop
 	case "max_tokens", "model_context_window_exceeded":
 		return fantasy.FinishReasonLength
@@ -1370,6 +1438,10 @@ func (a languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 					},
 				},
 			})
+		case "compaction":
+			// The SDK's stable types don't have a compaction block. So the
+			// block is read from its raw JSON and kept whole.
+			content = append(content, compactionContent(block.RawJSON(), compactionBetaOf(call)))
 		case "tool_use":
 			toolUse, ok := block.AsAny().(anthropic.ToolUseBlock)
 			if !ok {
@@ -1450,7 +1522,7 @@ func (a languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 			CacheReadTokens:     response.Usage.CacheReadInputTokens,
 		},
 		FinishReason:     mapFinishReason(string(response.StopReason)),
-		ProviderMetadata: fantasy.ProviderMetadata{},
+		ProviderMetadata: contextManagementMetadata(response.RawJSON()),
 		Warnings:         warnings,
 	}, nil
 }
@@ -1477,15 +1549,26 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 		}
 
 		sawMessageStop := false
+		finishMetadata := fantasy.ProviderMetadata{}
 
 		// openToolBlocks holds tool_use blocks announced by content_block_start
 		// but not yet ended. The accumulator cannot serve this: it drops blocks
 		// it could not index, and max_tokens truncation sends no stop event.
 		openToolBlocks := map[int64]*openToolBlock{}
+		// openCompactions holds compaction blocks still being streamed. The
+		// SDK's accumulator can't assemble them, because its types don't have
+		// a compaction block.
+		openCompactions := map[int64]*openCompaction{}
 
 		for stream.Next() {
 			chunk := stream.Current()
 			_ = acc.Accumulate(chunk)
+			// The message_delta event comes once per message. It carries
+			// what context management cleared and what compacting cost. The
+			// SDK's accumulator drops both. So they're read here.
+			if chunk.Type == "message_delta" {
+				finishMetadata = contextManagementMetadata(chunk.RawJSON())
+			}
 			switch chunk.Type {
 			case "content_block_start":
 				contentBlockType := chunk.ContentBlock.Type
@@ -1510,6 +1593,27 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 						ID:   fmt.Sprintf("%d", chunk.Index),
 					}) {
 						return
+					}
+				case "compaction":
+					open := newOpenCompaction(chunk.RawJSON())
+					openCompactions[chunk.Index] = open
+					if !yield(fantasy.StreamPart{
+						Type: fantasy.StreamPartTypeReasoningStart,
+						ID:   fmt.Sprintf("%d", chunk.Index),
+					}) {
+						return
+					}
+					// On-demand compaction sends the whole block on its
+					// start, without deltas. So the block's summary goes out
+					// as one delta.
+					if open.hasContent {
+						if !yield(fantasy.StreamPart{
+							Type:  fantasy.StreamPartTypeReasoningDelta,
+							ID:    fmt.Sprintf("%d", chunk.Index),
+							Delta: open.content.String(),
+						}) {
+							return
+						}
 					}
 				case "redacted_thinking":
 					if !yield(fantasy.StreamPart{
@@ -1545,6 +1649,17 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 				if open, ok := openToolBlocks[chunk.Index]; ok {
 					delete(openToolBlocks, chunk.Index)
 					if !open.close(acc, chunk.Index, yield) {
+						return
+					}
+					continue
+				}
+				if open, ok := openCompactions[chunk.Index]; ok {
+					delete(openCompactions, chunk.Index)
+					if !yield(fantasy.StreamPart{
+						Type:             fantasy.StreamPartTypeReasoningEnd,
+						ID:               fmt.Sprintf("%d", chunk.Index),
+						ProviderMetadata: fantasy.ProviderMetadata{Name: &CompactionMetadata{Block: open.block(), Beta: compactionBetaOf(call)}},
+					}) {
 						return
 					}
 					continue
@@ -1637,6 +1752,18 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 						Type:  fantasy.StreamPartTypeTextDelta,
 						ID:    fmt.Sprintf("%d", chunk.Index),
 						Delta: chunk.Delta.Text,
+					}) {
+						return
+					}
+				case "compaction_delta":
+					open, ok := openCompactions[chunk.Index]
+					if !ok {
+						continue
+					}
+					if !yield(fantasy.StreamPart{
+						Type:  fantasy.StreamPartTypeReasoningDelta,
+						ID:    fmt.Sprintf("%d", chunk.Index),
+						Delta: open.delta(chunk.RawJSON()),
 					}) {
 						return
 					}
@@ -1734,7 +1861,7 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 				CacheCreationTokens: acc.Usage.CacheCreationInputTokens,
 				CacheReadTokens:     acc.Usage.CacheReadInputTokens,
 			},
-			ProviderMetadata: fantasy.ProviderMetadata{},
+			ProviderMetadata: finishMetadata,
 		})
 	}, nil
 }

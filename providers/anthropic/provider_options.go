@@ -82,6 +82,8 @@ type ProviderOptions struct {
 	Effort                 *Effort                 `json:"effort"`
 	ThinkingDisplay        *ThinkingDisplay        `json:"thinking_display"`
 	DisableParallelToolUse *bool                   `json:"disable_parallel_tool_use"`
+	ContextManagement      *ContextManagement      `json:"context_management"`
+	Compaction             *Compaction             `json:"compaction"`
 	ExtraBody              map[string]any          `json:"extra_body,omitempty"`
 }
 
